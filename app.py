@@ -1,67 +1,62 @@
-# app.py
+import os
+import sys
+import bcrypt
+import uuid
+import re
+from datetime import datetime, timedelta
+import json
+
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendMessage
-import os
-import bcrypt
-import uuid
-import time
-from datetime import datetime, timedelta
-import json
-import re
 
 from dotenv import load_dotenv
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # 加載 .env 檔中的環境變數
 load_dotenv()
 
-# 從環境變數獲取 LINE Channel 憑證
+# --- 配置設定 ---
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-PASSWORD_SALT = os.getenv("PASSWORD_SALT").encode('utf-8') # 確保是 bytes
+# 確保 PASSWORD_SALT 存在並為 bytes
+PASSWORD_SALT = os.getenv("PASSWORD_SALT")
+if PASSWORD_SALT:
+    PASSWORD_SALT = PASSWORD_SALT.encode('utf-8')
+else:
+    # 如果沒有設置鹽值，則產生一個新的。請務必在生產環境中設置一個固定的、安全的鹽值
+    print("WARNING: PASSWORD_SALT is not set. Generating a new one. Please set PASSWORD_SALT in .env for production!")
+    PASSWORD_SALT = bcrypt.gensalt() # 生成一個新的鹽值
 
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET or not PASSWORD_SALT:
-    raise ValueError("LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, or PASSWORD_SALT are not set in .env")
+if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, PASSWORD_SALT]):
+    raise ValueError("LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, or PASSWORD_SALT are not fully set. Check your .env file.")
 
 app = Flask(__name__)
 
+# --- LINE Bot API 和 WebhookHandler 初始化 (只初始化一次，放在檔案頂部) ---
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # 導入資料庫相關
-from database import init_db, get_db # 確保這裡只導入需要的，避免循環引用
-from models import Team, Card, TeamCard, AdminPassword, TradeRequest # 這裡導入所有模型
+# 確保 database.py 和 models.py 在相同或可導入的路徑
+from database import init_db, get_db
+from models import Team, Card, TeamCard, AdminPassword, TradeRequest
 
-# --- 硬編碼卡牌資料 (根據您提供的資訊) ---
+# --- 硬編碼卡牌資料 ---
 INITIAL_CARDS_DATA = [
-    # 稀有
-    {"card_number": "1", "name_zh": "鍍白金"},
-    {"card_number": "2", "name_zh": "XRD D8"},
-    {"card_number": "3", "name_zh": "接觸角分析器"},
-    {"card_number": "4", "name_zh": "SEM SU8010"},
-    {"card_number": "5", "name_zh": "霍爾量測器"},
-    # 中等
-    {"card_number": "6", "name_zh": "青銅"},
-    {"card_number": "7", "name_zh": "黃銅"},
-    {"card_number": "8", "name_zh": "鋼"},
-    {"card_number": "9", "name_zh": "不鏽鋼"},
-    {"card_number": "10", "name_zh": "超合金"},
-    {"card_number": "11", "name_zh": "黃金"},
-    {"card_number": "12", "name_zh": "高熵合金"},
-    {"card_number": "13", "name_zh": "銀"},
-    {"card_number": "14", "name_zh": "鑽石"},
-    {"card_number": "15", "name_zh": "記憶合金"},
-    # 初等
-    {"card_number": "16", "name_zh": "鋁"},
-    {"card_number": "17", "name_zh": "鎳"},
-    {"card_number": "18", "name_zh": "銅"},
-    {"card_number": "19", "name_zh": "鎂"},
-    {"card_number": "20", "name_zh": "錫"},
-    {"card_number": "21", "name_zh": "鉻"},
-    {"card_number": "22", "name_zh": "鋅"},
-    {"card_number": "23", "name_zh": "碳"},
-    {"card_number": "24", "name_zh": "鐵"},
+    {"card_number": "1", "name_zh": "鍍白金"}, {"card_number": "2", "name_zh": "XRD D8"},
+    {"card_number": "3", "name_zh": "接觸角分析器"}, {"card_number": "4", "name_zh": "SEM SU8010"},
+    {"card_number": "5", "name_zh": "霍爾量測器"}, {"card_number": "6", "name_zh": "青銅"},
+    {"card_number": "7", "name_zh": "黃銅"}, {"card_number": "8", "name_zh": "鋼"},
+    {"card_number": "9", "name_zh": "不鏽鋼"}, {"card_number": "10", "name_zh": "超合金"},
+    {"card_number": "11", "name_zh": "黃金"}, {"card_number": "12", "name_zh": "高熵合金"},
+    {"card_number": "13", "name_zh": "銀"}, {"card_number": "14", "name_zh": "鑽石"},
+    {"card_number": "15", "name_zh": "記憶合金"}, {"card_number": "16", "name_zh": "鋁"},
+    {"card_number": "17", "name_zh": "鎳"}, {"card_number": "18", "name_zh": "銅"},
+    {"card_number": "19", "name_zh": "鎂"}, {"card_number": "20", "name_zh": "錫"},
+    {"card_number": "21", "name_zh": "鉻"}, {"card_number": "22", "name_zh": "鋅"},
+    {"card_number": "23", "name_zh": "碳"}, {"card_number": "24", "name_zh": "鐵"},
     {"card_number": "25", "name_zh": "鈷"},
 ]
 
@@ -75,47 +70,47 @@ def check_password(password, hashed_password):
     """驗證密碼"""
     try:
         return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
-    except ValueError:
-        # 如果 hashed_password 格式不正確 (例如不是 bcrypt 雜湊)，會拋出 ValueError
+    except ValueError as e:
+        app.logger.error(f"Error checking password: {e} with hashed_password: {hashed_password[:10]}...") # Log part of hash
         return False
 
 def get_user_session(user_id):
     """獲取用戶會話狀態 (簡化為字典，實際可考慮 Redis 或資料庫)"""
-    if not hasattr(get_user_session, 'sessions'):
-        get_user_session.sessions = {}
-    return get_user_session.sessions.get(user_id, {})
+    # 將 sessions 儲存在 app.config 中，使其更貼合 Flask 應用
+    if 'sessions' not in app.config:
+        app.config['sessions'] = {}
+    return app.config['sessions'].get(user_id, {})
 
 def set_user_session(user_id, session_data):
     """設置用戶會話狀態"""
-    if not hasattr(get_user_session, 'sessions'):
-        get_user_session.sessions = {}
-    get_user_session.sessions[user_id] = session_data
+    if 'sessions' not in app.config:
+        app.config['sessions'] = {}
+    app.config['sessions'][user_id] = session_data
 
 def clear_user_session(user_id):
     """清除用戶會話狀態"""
-    if hasattr(get_user_session, 'sessions'):
-        if user_id in get_user_session.sessions:
-            del get_user_session.sessions[user_id]
+    if 'sessions' in app.config and user_id in app.config['sessions']:
+        del app.config['sessions'][user_id]
 
-def find_card_by_input(db, card_input):
+def find_card_by_input(db_session, card_input):
     """根據卡號或名稱查找卡牌"""
-    card = db.query(Card).filter((Card.card_number == card_input) | (Card.name_zh == card_input)).first()
-    return card
+    return db_session.query(Card).filter((Card.card_number == card_input) | (Card.name_zh == card_input)).first()
 
 # --- 數據初始化函數 ---
 def add_initial_data(db_session):
     print("Checking and adding initial data...")
 
     # 添加隊伍 (8隊，編號 1 到 8)
-    team_names = [f"小隊{i}" for i in range(1, 9)] # 小隊1, 小隊2, ..., 小隊8
+    team_names = [f"小隊{i}" for i in range(1, 9)]
     team_passwords = [f"team_{i}_pass" for i in range(1, 9)]
     
     for i, name in enumerate(team_names):
+        # 檢查隊伍是否存在，避免重複添加
         if not db_session.query(Team).filter_by(name=name).first():
             new_team = Team(name=name, password_hash=hash_password(team_passwords[i]))
             db_session.add(new_team)
             print(f"Added Team: {name} with password '{team_passwords[i]}'")
-    db_session.commit()
+    db_session.commit() # 提交隊伍新增
 
     # 獲取所有隊伍的 ID，用於關主權限設定
     all_teams = db_session.query(Team).all()
@@ -131,20 +126,19 @@ def add_initial_data(db_session):
             )
             db_session.add(new_card)
             print(f"Added Card: {card_data['name_zh']} ({card_data['card_number']})")
-    db_session.commit()
+    db_session.commit() # 提交卡牌新增
 
     # 添加關主和主辦方密碼
-    # 關主密碼 (8組：A1-A4, B1-B4)
-    # 每組關主負責2個小隊，這裡隨機分配，您可以根據實際需求調整
+    # 關主密碼 (8組：A1-A8，根據您之前提供的密碼列表)
     admin_passwords_data = [
         {"role": "game_master", "password": "gm_A1_pass", "team_scope": f"{team_id_map.get('小隊1')},{team_id_map.get('小隊2')}"},
         {"role": "game_master", "password": "gm_A2_pass", "team_scope": f"{team_id_map.get('小隊3')},{team_id_map.get('小隊4')}"},
         {"role": "game_master", "password": "gm_A3_pass", "team_scope": f"{team_id_map.get('小隊5')},{team_id_map.get('小隊6')}"},
         {"role": "game_master", "password": "gm_A4_pass", "team_scope": f"{team_id_map.get('小隊7')},{team_id_map.get('小隊8')}"},
-        {"role": "game_master", "password": "gm_B1_pass", "team_scope": f"{team_id_map.get('小隊1')},{team_id_map.get('小隊3')}"},
-        {"role": "game_master", "password": "gm_B2_pass", "team_scope": f"{team_id_map.get('小隊2')},{team_id_map.get('小隊4')}"},
-        {"role": "game_master", "password": "gm_B3_pass", "team_scope": f"{team_id_map.get('小隊5')},{team_id_map.get('小隊7')}"},
-        {"role": "game_master", "password": "gm_B4_pass", "team_scope": f"{team_id_map.get('小隊6')},{team_id_map.get('小隊8')}"},
+        {"role": "game_master", "password": "gm_A5_pass", "team_scope": f"{team_id_map.get('小隊1')},{team_id_map.get('小隊3')}"}, # 這是基於您之前提供的 A5-A8 假設範圍
+        {"role": "game_master", "password": "gm_A6_pass", "team_scope": f"{team_id_map.get('小隊2')},{team_id_map.get('小隊4')}"},
+        {"role": "game_master", "password": "gm_A7_pass", "team_scope": f"{team_id_map.get('小隊5')},{team_id_map.get('小隊7')}"},
+        {"role": "game_master", "password": "gm_A8_pass", "team_scope": f"{team_id_map.get('小隊6')},{team_id_map.get('小隊8')}"},
         
         # 主辦方密碼 (12組：A-L)
         {"role": "organizer", "password": "org_A_pass", "team_scope": all_team_ids_str},
@@ -162,16 +156,20 @@ def add_initial_data(db_session):
     ]
 
     for ad_data in admin_passwords_data:
-        # 檢查是否存在相同角色和密碼雜湊的記錄
+        # 由於 password_hash 是動態生成，直接檢查 role 和 password_hash 會很難
+        # 更好的方法是檢查 role + 明文密碼 (如果可以)，或假設每次部署都重新檢查並更新/添加
+        # 這裡我們假設如果角色和密碼的雜湊值都匹配，則認為已存在
+        # 或者更簡單地，檢查是否已存在一個相同明文密碼的 AdminPassword 記錄
+        hashed_pw = hash_password(ad_data["password"])
         existing_admin = db_session.query(AdminPassword).filter_by(
             role=ad_data["role"],
-            password_hash=hash_password(ad_data["password"])
+            password_hash=hashed_pw # 檢查雜湊值是否匹配
         ).first()
 
         if not existing_admin:
             db_session.add(AdminPassword(
                 role=ad_data["role"],
-                password_hash=hash_password(ad_data["password"]),
+                password_hash=hashed_pw,
                 team_scope=ad_data["team_scope"]
             ))
             print(f"Added Admin: {ad_data['role']} with password '{ad_data['password']}'")
@@ -180,15 +178,14 @@ def add_initial_data(db_session):
     print("Initial data check and addition complete.")
 
 
-# 初始化資料庫（如果表不存在則創建）
+# --- 初始化資料庫（如果表不存在則創建）---
 with app.app_context():
     init_db() # 確保表已創建
-    db = next(get_db())
+    db = next(get_db()) # 獲取資料庫會話
     try:
         add_initial_data(db) # 添加初始數據
     finally:
-        db.close()
-
+        db.close() # 確保資料庫會話被關閉
 
 # --- LINE Bot Webhook 處理 ---
 
@@ -201,8 +198,13 @@ def callback():
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("Invalid signature. Please check your channel access token/channel secret.")
+        print("Invalid signature. Please check your channel access token/channel secret.", file=sys.stderr)
         abort(400)
+    except Exception as e:
+        print(f"Error handling webhook: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr) # 打印詳細錯誤堆疊到 stderr
+        abort(500)
 
     return 'OK'
 
@@ -211,8 +213,8 @@ def handle_message(event):
     text = event.message.text.strip()
     user_id = event.source.user_id
     reply_token = event.reply_token
-    session = get_user_session(user_id)
     db = next(get_db()) # 獲取資料庫會話
+    session = get_user_session(user_id) # 獲取用戶會話狀態
 
     try:
         # --- 登入邏輯 ---
@@ -222,7 +224,7 @@ def handle_message(event):
             found_team = None
             teams = db.query(Team).all()
             for t in teams:
-                if check_password(password_input, t.password_hash):
+                if check_password(password_input, t.password_hash): # 使用 check_password 驗證
                     found_team = t
                     break
 
@@ -233,12 +235,12 @@ def handle_message(event):
                 line_bot_api.reply_message(reply_token, TextSendMessage(text="密碼錯誤，請重試。"))
             return
 
-        elif text.startswith("管理員密碼 "): # 統一使用「管理員密碼」作為前綴
+        elif text.startswith("管理員密碼 "):
             password_input = text.split(" ", 1)[1]
             found_admin = None
             admins = db.query(AdminPassword).all()
             for admin in admins:
-                if check_password(password_input, admin.password_hash):
+                if check_password(password_input, admin.password_hash): # 使用 check_password 驗證
                     found_admin = admin
                     break
 
@@ -338,15 +340,14 @@ def handle_message(event):
         # --- 關主/主辦方功能 ---
         elif session["logged_in_as"] in ["game_master", "organizer"]:
             admin_role = session["logged_in_as"]
-            team_scope = session.get("team_scope")
+            team_scope_str = session.get("team_scope")
             
-            # 將 team_scope 轉換為可操作的隊伍 ID 列表
             allowed_team_ids = None
-            if team_scope:
+            if team_scope_str:
                 try:
-                    allowed_team_ids = [int(x) for x in team_scope.split(',')]
+                    allowed_team_ids = [int(x) for x in team_scope_str.split(',')]
                 except ValueError:
-                    app.logger.error(f"Invalid team_scope format: {team_scope} for user {user_id}")
+                    app.logger.error(f"Invalid team_scope format: {team_scope_str} for user {user_id}")
                     allowed_team_ids = [] # 無效格式則無權限
 
             def check_team_access(team_obj_or_id):
@@ -469,8 +470,11 @@ def handle_message(event):
 
                     # 交易請求邏輯 (兩階段確認)
                     current_time = datetime.now()
-                    one_minute_ago = current_time - timedelta(minutes=1)
+                    # 考慮請求過期時間，這裡設置為 5 分鐘
+                    trade_request_expiry_minutes = 5 
+                    five_minutes_ago = current_time - timedelta(minutes=trade_request_expiry_minutes)
                     
+                    # 查詢未過期且匹配的請求
                     existing_request = db.query(TradeRequest).filter(
                         TradeRequest.action_type == 'team_to_team_trade',
                         TradeRequest.team_a_id == team_a.id,
@@ -479,56 +483,56 @@ def handle_message(event):
                         TradeRequest.card_a_quantity == qty_a,
                         TradeRequest.card_b_id == card_b.id,
                         TradeRequest.card_b_quantity == qty_b,
-                        TradeRequest.status.in_(['pending', 'confirmed_one']),
-                        TradeRequest.created_at >= one_minute_ago
+                        TradeRequest.status.in_(['pending']), # 僅查找 pending 狀態
+                        TradeRequest.created_at >= five_minutes_ago
                     ).first()
 
                     if existing_request:
-                        # 這是第二人確認
-                        confirmed_users_list = existing_request.confirmed_by_users.split(',') if existing_request.confirmed_by_users else []
-                        if user_id not in confirmed_users_list: # 確保不是同一個人重複確認
-                            confirmed_users_list.append(user_id)
-                            existing_request.confirmed_by_users = ",".join(confirmed_users_list)
-                            existing_request.status = 'completed' # 兩人確認即完成
+                        # 這是第二人確認，確保不是同一個用戶重複確認
+                        if existing_request.requester_user_id == user_id:
+                            line_bot_api.reply_message(reply_token, TextSendMessage(text="您已發起過此交換請求，請等待另一位具有相同權限的夥伴確認。"))
+                            return
+                        
+                        existing_request.status = 'completed' # 兩人確認即完成
+                        existing_request.completed_at = current_time # 記錄完成時間
 
-                            # 執行交易
-                            # A隊減少卡A，增加卡B
-                            if team_a_has_card_a:
-                                team_a_has_card_a.quantity -= qty_a
-                                if team_a_has_card_a.quantity == 0:
-                                    db.delete(team_a_has_card_a)
-                            
-                            team_a_gets_card_b = db.query(TeamCard).filter(TeamCard.team_id == team_a.id, TeamCard.card_id == card_b.id).first()
-                            if team_a_gets_card_b:
-                                team_a_gets_card_b.quantity += qty_b
-                            else:
-                                db.add(TeamCard(team_id=team_a.id, card_id=card_b.id, quantity=qty_b))
-
-                            # B隊減少卡B，增加卡A
-                            if team_b_has_card_b:
-                                team_b_has_card_b.quantity -= qty_b
-                                if team_b_has_card_b.quantity == 0:
-                                    db.delete(team_b_has_card_b)
-                            
-                            team_b_gets_card_a = db.query(TeamCard).filter(TeamCard.team_id == team_b.id, TeamCard.card_id == card_a.id).first()
-                            if team_b_gets_card_a:
-                                team_b_gets_card_a.quantity += qty_a
-                            else:
-                                db.add(TeamCard(team_id=team_b.id, card_id=card_a.id, quantity=qty_a))
-
-                            db.commit() # 提交卡牌數量變更
-                            
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"交換成功！{team_a.name} 與 {team_b.name} 已完成卡牌交換。"))
-                            
-                            # 通知發起者 (如果不是同一個用戶)
-                            if existing_request.requester_user_id != user_id:
-                                try:
-                                    line_bot_api.push_message(existing_request.requester_user_id, TextSendMessage(text="您發起的卡牌交換已成功確認並執行！"))
-                                except Exception as e:
-                                    app.logger.error(f"Failed to push message to requester: {e}")
+                        # 執行交易 (A隊減少卡A，增加卡B；B隊減少卡B，增加卡A)
+                        # 處理 team_a 的卡牌
+                        if team_a_has_card_a:
+                            team_a_has_card_a.quantity -= qty_a
+                            if team_a_has_card_a.quantity <= 0: # 數量為0或負數則刪除
+                                db.delete(team_a_has_card_a)
+                        
+                        team_a_gets_card_b = db.query(TeamCard).filter(TeamCard.team_id == team_a.id, TeamCard.card_id == card_b.id).first()
+                        if team_a_gets_card_b:
+                            team_a_gets_card_b.quantity += qty_b
                         else:
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text="您已確認過此交換請求，請等待另一位夥伴確認。"))
+                            db.add(TeamCard(team_id=team_a.id, card_id=card_b.id, quantity=qty_b))
 
+                        # 處理 team_b 的卡牌
+                        if team_b_has_card_b:
+                            team_b_has_card_b.quantity -= qty_b
+                            if team_b_has_card_b.quantity <= 0: # 數量為0或負數則刪除
+                                db.delete(team_b_has_card_b)
+                        
+                        team_b_gets_card_a = db.query(TeamCard).filter(TeamCard.team_id == team_b.id, TeamCard.card_id == card_a.id).first()
+                        if team_b_gets_card_a:
+                            team_b_gets_card_a.quantity += qty_a
+                        else:
+                            db.add(TeamCard(team_id=team_b.id, card_id=card_a.id, quantity=qty_a))
+
+                        db.commit() # 提交所有卡牌數量變更
+
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"交換成功！{team_a.name} 與 {team_b.name} 已完成卡牌交換。"))
+                        
+                        # 通知發起者 (如果不是同一個用戶，且對方存在)
+                        try:
+                            # 獲取發起請求的用戶 ID
+                            original_requester_user_id = existing_request.requester_user_id
+                            if original_requester_user_id and original_requester_user_id != user_id:
+                                line_bot_api.push_message(original_requester_user_id, TextSendMessage(text="您發起的卡牌交換已成功確認並執行！"))
+                        except Exception as e:
+                            app.logger.error(f"Failed to push message to original requester: {e}")
                     else:
                         # 這是第一次發起請求
                         new_request_id = str(uuid.uuid4()) # 生成唯一的請求 ID
@@ -543,11 +547,11 @@ def handle_message(event):
                             card_a_quantity=qty_a,
                             card_b_id=card_b.id,
                             card_b_quantity=qty_b,
-                            confirmed_by_users=user_id # 記錄第一個確認者
+                            created_at=current_time # 記錄創建時間
                         )
                         db.add(new_trade_request)
                         db.commit()
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"卡牌交換請求已發起！請在1分鐘內由另一位具有相同權限的夥伴輸入**完全相同**的指令以確認交換。"))
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"卡牌交換請求已發起！請在 {trade_request_expiry_minutes} 分鐘內由另一位具有相同權限的夥伴輸入**完全相同**的指令以確認交換。"))
 
                 else:
                     line_bot_api.reply_message(reply_token, TextSendMessage(text=f"指令格式：交換 [隊伍A名稱] [隊伍B名稱] [卡牌A號/名] [卡牌A數量] [卡牌B號/名] [卡牌B數量]"))
@@ -560,13 +564,12 @@ def handle_message(event):
                 line_bot_api.reply_message(reply_token, TextSendMessage(text="無法識別的管理員指令。請使用：新增、刪除、交換 或 登出。"))
 
     except Exception as e:
-        app.logger.error(f"Error handling message: {e}", exc_info=True)
+        app.logger.error(f"Error handling message for user {user_id}: {e}", exc_info=True)
         line_bot_api.reply_message(reply_token, TextSendMessage(text="系統發生錯誤，請稍後再試。"))
     finally:
         db.close() # 確保資料庫會話被關閉
 
 # --- 後台任務 (例如清除過期交易請求) ---
-from apscheduler.schedulers.background import BackgroundScheduler
 
 def cleanup_expired_trade_requests():
     """清理過期的交易請求"""
@@ -574,19 +577,24 @@ def cleanup_expired_trade_requests():
         db = next(get_db())
         try:
             current_time = datetime.now()
-            # 這裡的時間差必須和指令中的「1分鐘之內」保持一致
-            expired_time_limit = timedelta(minutes=1)
+            # 與交易指令中的時間限制保持一致
+            expired_time_limit = timedelta(minutes=5) 
             expired_requests = db.query(TradeRequest).filter(
-                TradeRequest.status.in_(['pending', 'confirmed_one']), # 考慮這兩種狀態
+                TradeRequest.status.in_(['pending']), # 只清理 pending 狀態的請求
                 (current_time - TradeRequest.created_at) > expired_time_limit
             ).all()
 
             for req in expired_requests:
                 req.status = 'expired'
-                app.logger.info(f"Trade request {req.request_id} expired.")
+                app.logger.info(f"Trade request {req.request_id} expired and marked.")
+                # 可以選擇通知發起者請求已過期
+                try:
+                    line_bot_api.push_message(req.requester_user_id, TextSendMessage(text="您發起的卡牌交換請求已過期，請重新發起。"))
+                except Exception as e:
+                    app.logger.error(f"Failed to notify requester {req.requester_user_id} about expired trade: {e}")
             db.commit()
         except Exception as e:
-            app.logger.error(f"Error cleaning up expired requests: {e}")
+            app.logger.error(f"Error cleaning up expired requests: {e}", exc_info=True)
         finally:
             db.close()
 

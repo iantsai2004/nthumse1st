@@ -1,610 +1,455 @@
-import os
-import sys
-import bcrypt
-import uuid
-import re
-from datetime import datetime, timedelta
-import json
+# app.py
 
+# IMPORTANT: Gevent monkey patching MUST be done as early as possible.
+# This ensures that standard library modules like 'ssl' are patched
+# before other libraries (like requests, urllib3) import them.
+import gevent.monkey
+gevent.monkey.patch_all()
+
+import os
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendMessage
-
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.date import DateTrigger
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-# 加載 .env 檔中的環境變數
+# --- Configuration ---
+# Load environment variables from .env file
 load_dotenv()
 
-# --- 配置設定 ---
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-# 確保 PASSWORD_SALT 存在並為 bytes
-PASSWORD_SALT = os.getenv("PASSWORD_SALT")
-if PASSWORD_SALT:
-    PASSWORD_SALT = PASSWORD_SALT.encode('utf-8')
-else:
-    # 如果沒有設置鹽值，則產生一個新的。請務必在生產環境中設置一個固定的、安全的鹽值
-    print("WARNING: PASSWORD_SALT is not set. Generating a new one. Please set PASSWORD_SALT in .env for production!")
-    PASSWORD_SALT = bcrypt.gensalt() # 生成一個新的鹽值
+# Line Bot API Configuration
+CHANNEL_ACCESS_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+CHANNEL_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 
-if not all([LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, PASSWORD_SALT]):
-    raise ValueError("LINE_CHANNEL_ACCESS_TOKEN, LINE_CHANNEL_SECRET, or PASSWORD_SALT are not fully set. Check your .env file.")
+if not CHANNEL_ACCESS_TOKEN:
+    raise ValueError("LINE_CHANNEL_ACCESS_TOKEN environment variable not set.")
+if not CHANNEL_SECRET:
+    raise ValueError("LINE_CHANNEL_SECRET environment variable not set.")
+
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(CHANNEL_SECRET)
 
 app = Flask(__name__)
 
-# --- LINE Bot API 和 WebhookHandler 初始化 (只初始化一次，放在檔案頂部) ---
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# --- Database Configuration (SQLite for simplicity) ---
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///app.db')
+engine = create_engine(DATABASE_URL)
+Base = declarative_base()
+Session = sessionmaker(bind=engine)
 
-# 導入資料庫相關
-# 確保 database.py 和 models.py 在相同或可導入的路徑
-from database import init_db, get_db
-from models import Team, Card, TeamCard, AdminPassword, TradeRequest
+# --- Database Models ---
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(50), unique=True, nullable=False)
+    role = Column(String(20), default='guest')  # 'guest', 'team', 'admin'
+    team_name = Column(String(50), nullable=True)
+    last_active = Column(DateTime, default=datetime.utcnow)
+    team_password = Column(String(50), nullable=True) # Storing passwords directly for simplicity, hash in real app
+    admin_password = Column(String(50), nullable=True) # Storing passwords directly for simplicity, hash in real app
 
-# --- 硬編碼卡牌資料 ---
-INITIAL_CARDS_DATA = [
-    {"card_number": "1", "name_zh": "鍍白金"}, {"card_number": "2", "name_zh": "XRD D8"},
-    {"card_number": "3", "name_zh": "接觸角分析器"}, {"card_number": "4", "name_zh": "SEM SU8010"},
-    {"card_number": "5", "name_zh": "霍爾量測器"}, {"card_number": "6", "name_zh": "青銅"},
-    {"card_number": "7", "name_zh": "黃銅"}, {"card_number": "8", "name_zh": "鋼"},
-    {"card_number": "9", "name_zh": "不鏽鋼"}, {"card_number": "10", "name_zh": "超合金"},
-    {"card_number": "11", "name_zh": "黃金"}, {"card_number": "12", "name_zh": "高熵合金"},
-    {"card_number": "13", "name_zh": "銀"}, {"card_number": "14", "name_zh": "鑽石"},
-    {"card_number": "15", "name_zh": "記憶合金"}, {"card_number": "16", "name_zh": "鋁"},
-    {"card_number": "17", "name_zh": "鎳"}, {"card_number": "18", "name_zh": "銅"},
-    {"card_number": "19", "name_zh": "鎂"}, {"card_number": "20", "name_zh": "錫"},
-    {"card_number": "21", "name_zh": "鉻"}, {"card_number": "22", "name_zh": "鋅"},
-    {"card_number": "23", "name_zh": "碳"}, {"card_number": "24", "name_zh": "鐵"},
-    {"card_number": "25", "name_zh": "鈷"},
-]
+class Mission(Base):
+    __tablename__ = 'missions'
+    id = Column(Integer, primary_key=True)
+    mission_code = Column(String(20), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500))
+    is_completed = Column(Boolean, default=False)
+    completion_time = Column(DateTime, nullable=True)
+    completed_by_team = Column(String(50), nullable=True)
 
-# --- 輔助函數 ---
+class Announcement(Base):
+    __tablename__ = 'announcements'
+    id = Column(Integer, primary_key=True)
+    message = Column(String(500), nullable=False)
+    scheduled_time = Column(DateTime, nullable=True)
+    sent = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
-def hash_password(password):
-    """雜湊密碼"""
-    return bcrypt.hashpw(password.encode('utf-8'), PASSWORD_SALT).decode('utf-8')
+# --- Database Initialization ---
+def init_db():
+    print("Initializing database...")
+    Base.metadata.create_all(engine)
+    print("Database initialized.")
 
-def check_password(password, hashed_password):
-    """驗證密碼"""
-    try:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
-    except ValueError as e:
-        app.logger.error(f"Error checking password: {e} with hashed_password: {hashed_password[:10]}...") # Log part of hash
-        return False
-
-def get_user_session(user_id):
-    """獲取用戶會話狀態 (簡化為字典，實際可考慮 Redis 或資料庫)"""
-    # 將 sessions 儲存在 app.config 中，使其更貼合 Flask 應用
-    if 'sessions' not in app.config:
-        app.config['sessions'] = {}
-    return app.config['sessions'].get(user_id, {})
-
-def set_user_session(user_id, session_data):
-    """設置用戶會話狀態"""
-    if 'sessions' not in app.config:
-        app.config['sessions'] = {}
-    app.config['sessions'][user_id] = session_data
-
-def clear_user_session(user_id):
-    """清除用戶會話狀態"""
-    if 'sessions' in app.config and user_id in app.config['sessions']:
-        del app.config['sessions'][user_id]
-
-def find_card_by_input(db_session, card_input):
-    """根據卡號或名稱查找卡牌"""
-    return db_session.query(Card).filter((Card.card_number == card_input) | (Card.name_zh == card_input)).first()
-
-# --- 數據初始化函數 ---
-def add_initial_data(db_session):
+def add_initial_data():
     print("Checking and adding initial data...")
+    session = Session()
 
-    # 添加隊伍 (8隊，編號 1 到 8)
-    team_names = [f"小隊{i}" for i in range(1, 9)]
-    team_passwords = [f"team_{i}_pass" for i in range(1, 9)]
-    
-    for i, name in enumerate(team_names):
-        # 檢查隊伍是否存在，避免重複添加
-        if not db_session.query(Team).filter_by(name=name).first():
-            new_team = Team(name=name, password_hash=hash_password(team_passwords[i]))
-            db_session.add(new_team)
-            print(f"Added Team: {name} with password '{team_passwords[i]}'")
-    db_session.commit() # 提交隊伍新增
+    # Add initial admin users if they don't exist
+    admin_passwords = ['gm_A5_pass', 'gm_A6_pass', 'gm_A7_pass', 'gm_A8_pass']
+    for pwd in admin_passwords:
+        if not session.query(User).filter_by(role='admin', admin_password=pwd).first():
+            new_admin = User(user_id=f'admin_placeholder_{pwd}', role='admin', team_name='game_master', admin_password=pwd)
+            session.add(new_admin)
+            print(f"Added Admin: game_master with password '{pwd}'")
 
-    # 獲取所有隊伍的 ID，用於關主權限設定
-    all_teams = db_session.query(Team).all()
-    team_id_map = {team.name: team.id for team in all_teams}
-    all_team_ids_str = ",".join(str(t.id) for t in all_teams)
-
-    # 添加卡牌
-    for card_data in INITIAL_CARDS_DATA:
-        if not db_session.query(Card).filter_by(card_number=card_data["card_number"]).first():
-            new_card = Card(
-                card_number=card_data["card_number"],
-                name_zh=card_data["name_zh"]
-            )
-            db_session.add(new_card)
-            print(f"Added Card: {card_data['name_zh']} ({card_data['card_number']})")
-    db_session.commit() # 提交卡牌新增
-
-    # 添加關主和主辦方密碼
-    # 關主密碼 (8組：A1-A8，根據您之前提供的密碼列表)
-    admin_passwords_data = [
-        {"role": "game_master", "password": "gm_A1_pass", "team_scope": f"{team_id_map.get('小隊1')},{team_id_map.get('小隊2')}"},
-        {"role": "game_master", "password": "gm_A2_pass", "team_scope": f"{team_id_map.get('小隊3')},{team_id_map.get('小隊4')}"},
-        {"role": "game_master", "password": "gm_A3_pass", "team_scope": f"{team_id_map.get('小隊5')},{team_id_map.get('小隊6')}"},
-        {"role": "game_master", "password": "gm_A4_pass", "team_scope": f"{team_id_map.get('小隊7')},{team_id_map.get('小隊8')}"},
-        {"role": "game_master", "password": "gm_A5_pass", "team_scope": f"{team_id_map.get('小隊1')},{team_id_map.get('小隊3')}"}, # 這是基於您之前提供的 A5-A8 假設範圍
-        {"role": "game_master", "password": "gm_A6_pass", "team_scope": f"{team_id_map.get('小隊2')},{team_id_map.get('小隊4')}"},
-        {"role": "game_master", "password": "gm_A7_pass", "team_scope": f"{team_id_map.get('小隊5')},{team_id_map.get('小隊7')}"},
-        {"role": "game_master", "password": "gm_A8_pass", "team_scope": f"{team_id_map.get('小隊6')},{team_id_map.get('小隊8')}"},
-        
-        # 主辦方密碼 (12組：A-L)
-        {"role": "organizer", "password": "org_A_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_B_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_C_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_D_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_E_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_F_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_G_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_H_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_I_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_J_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_K_pass", "team_scope": all_team_ids_str},
-        {"role": "organizer", "password": "org_L_pass", "team_scope": all_team_ids_str},
-    ]
-
-    for ad_data in admin_passwords_data:
-        # 由於 password_hash 是動態生成，直接檢查 role 和 password_hash 會很難
-        # 更好的方法是檢查 role + 明文密碼 (如果可以)，或假設每次部署都重新檢查並更新/添加
-        # 這裡我們假設如果角色和密碼的雜湊值都匹配，則認為已存在
-        # 或者更簡單地，檢查是否已存在一個相同明文密碼的 AdminPassword 記錄
-        hashed_pw = hash_password(ad_data["password"])
-        existing_admin = db_session.query(AdminPassword).filter_by(
-            role=ad_data["role"],
-            password_hash=hashed_pw # 檢查雜湊值是否匹配
-        ).first()
-
-        if not existing_admin:
-            db_session.add(AdminPassword(
-                role=ad_data["role"],
-                password_hash=hashed_pw,
-                team_scope=ad_data["team_scope"]
-            ))
-            print(f"Added Admin: {ad_data['role']} with password '{ad_data['password']}'")
-    db_session.commit()
-
+    session.commit()
+    session.close()
     print("Initial data check and addition complete.")
 
+# --- Helper Functions ---
+def get_user(user_id):
+    session = Session()
+    user = session.query(User).filter_by(user_id=user_id).first()
+    session.close()
+    return user
 
-# --- 初始化資料庫（如果表不存在則創建）---
-with app.app_context():
-    init_db() # 確保表已創建
-    db = next(get_db()) # 獲取資料庫會話
+def create_or_update_user(user_id, role='guest', team_name=None, team_password=None, admin_password=None):
+    session = Session()
+    user = session.query(User).filter_by(user_id=user_id).first()
+    if user:
+        user.role = role
+        user.team_name = team_name
+        user.last_active = datetime.utcnow()
+        if team_password:
+            user.team_password = team_password
+        if admin_password:
+            user.admin_password = admin_password
+    else:
+        user = User(user_id=user_id, role=role, team_name=team_name,
+                    team_password=team_password, admin_password=admin_password,
+                    last_active=datetime.utcnow())
+        session.add(user)
+    session.commit()
+    session.close()
+    return user
+
+def get_mission_by_code(mission_code):
+    session = Session()
+    mission = session.query(Mission).filter_by(mission_code=mission_code).first()
+    session.close()
+    return mission
+
+def get_all_missions():
+    session = Session()
+    missions = session.query(Mission).all()
+    session.close()
+    return missions
+
+def get_all_teams():
+    session = Session()
+    teams = session.query(User).filter_by(role='team').all()
+    session.close()
+    return teams
+
+def get_all_admins():
+    session = Session()
+    admins = session.query(User).filter_by(role='admin').all()
+    session.close()
+    return admins
+
+# --- Scheduler for Announcements ---
+scheduler = BackgroundScheduler(daemon=True)
+
+def send_announcement(announcement_id, user_id=None):
+    session = Session()
+    announcement = session.query(Announcement).filter_by(id=announcement_id).first()
+    if announcement and not announcement.sent:
+        try:
+            # Send to all users if user_id is not specified (broadcast)
+            if user_id is None:
+                users = session.query(User).all()
+                for user in users:
+                    try:
+                        line_bot_api.push_message(user.user_id, TextSendMessage(text=f"📢 公告：\n{announcement.message}"))
+                    except Exception as e:
+                        app.logger.error(f"Failed to send announcement to user {user.user_id}: {e}")
+            else:
+                # Send to a specific user
+                line_bot_api.push_message(user_id, TextSendMessage(text=f"📢 公告：\n{announcement.message}"))
+
+            announcement.sent = True
+            session.commit()
+            app.logger.info(f"Announcement '{announcement.message}' sent successfully.")
+        except Exception as e:
+            app.logger.error(f"Error sending announcement ID {announcement_id}: {e}")
+            session.rollback()
+    session.close()
+
+def schedule_announcement(message, scheduled_time_str):
+    session = Session()
     try:
-        add_initial_data(db) # 添加初始數據
+        # Assuming scheduled_time_str is in 'YYYY-MM-DD HH:MM' format and local timezone (Taiwan)
+        taiwan_tz = pytz.timezone('Asia/Taipei')
+        scheduled_time = taiwan_tz.localize(datetime.strptime(scheduled_time_str, '%Y-%m-%d %H:%M'))
+        # Convert to UTC for APScheduler
+        scheduled_time_utc = scheduled_time.astimezone(pytz.utc)
+
+        new_announcement = Announcement(message=message, scheduled_time=scheduled_time_utc)
+        session.add(new_announcement)
+        session.commit()
+
+        # Schedule the job
+        scheduler.add_job(
+            send_announcement,
+            DateTrigger(run_date=scheduled_time_utc),
+            args=[new_announcement.id],
+            id=f'announcement_{new_announcement.id}',
+            replace_existing=True
+        )
+        app.logger.info(f"Announcement '{message}' scheduled for {scheduled_time_str}.")
+        return True
+    except ValueError:
+        app.logger.error(f"Invalid datetime format: {scheduled_time_str}")
+        return False
+    except Exception as e:
+        app.logger.error(f"Error scheduling announcement: {e}")
+        session.rollback()
+        return False
     finally:
-        db.close() # 確保資料庫會話被關閉
+        session.close()
 
-# --- LINE Bot Webhook 處理 ---
+def get_all_scheduled_announcements():
+    session = Session()
+    announcements = session.query(Announcement).filter_by(sent=False).order_by(Announcement.scheduled_time).all()
+    session.close()
+    return announcements
 
+def cancel_announcement_by_id(announcement_id):
+    session = Session()
+    announcement = session.query(Announcement).filter_by(id=announcement_id).first()
+    if announcement:
+        try:
+            scheduler.remove_job(f'announcement_{announcement_id}')
+            session.delete(announcement)
+            session.commit()
+            app.logger.info(f"Announcement ID {announcement_id} cancelled and deleted.")
+            return True
+        except Exception as e:
+            app.logger.error(f"Error cancelling announcement ID {announcement_id}: {e}")
+            session.rollback()
+            return False
+    session.close()
+    return False
+
+# --- Webhook Handler ---
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    app.logger.info("Request body: %s", body)
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
-        print("Invalid signature. Please check your channel access token/channel secret.", file=sys.stderr)
+        app.logger.error("Invalid signature. Please check your channel access token/channel secret.")
         abort(400)
     except Exception as e:
-        print(f"Error handling webhook: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr) # 打印詳細錯誤堆疊到 stderr
-        abort(500)
+        app.logger.error(f"Error handling webhook: {e}")
+        # Here's the crucial part: if an error occurs while handling a message,
+        # ensure you don't re-trigger the same error by attempting to reply
+        # in a way that creates an infinite loop.
+        # The recursion itself is usually within the handle_message,
+        # so this outer handler might catch it after the fact.
+        return 'OK' # Return OK to LINE to prevent retries, but log the error
 
     return 'OK'
 
+# --- Message Handler ---
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    text = event.message.text.strip()
-    user_id = event.source.user_id
     reply_token = event.reply_token
-    db = next(get_db()) # 獲取資料庫會話
-    session = get_user_session(user_id) # 獲取用戶會話狀態
+    user_id = event.source.user_id
+    text = event.message.text.strip()
+    user = get_user(user_id)
 
-    try:
-        # --- 登入邏輯 ---
-        if text.startswith("密碼 "):
-            password_input = text.split(" ", 1)[1]
-            
-            found_team = None
-            teams = db.query(Team).all()
-            for t in teams:
-                if check_password(password_input, t.password_hash): # 使用 check_password 驗證
-                    found_team = t
-                    break
+    # --- Initial Login/Registration Logic ---
+    if not user or user.role == 'guest':
+        # Check for team password command
+        if text.lower().startswith('密碼 '):
+            parts = text.split(' ', 1)
+            if len(parts) == 2:
+                password_attempt = parts[1]
+                session = Session()
+                existing_team_user = session.query(User).filter_by(role='team', team_password=password_attempt).first()
+                if existing_team_user:
+                    # Update current user or create new if not exists
+                    create_or_update_user(user_id, role='team', team_name=f'隊伍-{password_attempt}', team_password=password_attempt)
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"登入成功！您已加入隊伍 {password_attempt}。"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="隊伍密碼錯誤，請重新輸入或輸入管理員密碼。"))
+                session.close()
+                return # Crucial: Exit after handling password input
 
-            if found_team:
-                set_user_session(user_id, {"logged_in_as": "team", "team_id": found_team.id, "team_name": found_team.name})
-                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"登入成功！您已連接到 {found_team.name} 的資料。"))
-            else:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="密碼錯誤，請重試。"))
-            return
+        # Check for admin password command
+        elif text.lower().startswith('管理員密碼 '):
+            parts = text.split(' ', 1)
+            if len(parts) == 2:
+                admin_password_attempt = parts[1]
+                session = Session()
+                existing_admin_user = session.query(User).filter_by(role='admin', admin_password=admin_password_attempt).first()
+                if existing_admin_user:
+                    create_or_update_user(user_id, role='admin', team_name='game_master', admin_password=admin_password_attempt)
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="管理員登入成功！您現在擁有管理員權限。"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="管理員密碼錯誤，請重新輸入。"))
+                session.close()
+                return # Crucial: Exit after handling password input
 
-        elif text.startswith("管理員密碼 "):
-            password_input = text.split(" ", 1)[1]
-            found_admin = None
-            admins = db.query(AdminPassword).all()
-            for admin in admins:
-                if check_password(password_input, admin.password_hash): # 使用 check_password 驗證
-                    found_admin = admin
-                    break
-
-            if found_admin:
-                set_user_session(user_id, {"logged_in_as": found_admin.role, "admin_id": found_admin.id, "team_scope": found_admin.team_scope})
-                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"管理員登入成功！您的權限為：{found_admin.role}"))
-            else:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="管理員密碼錯誤，請重試。"))
-            return
-
-        # --- 檢查登入狀態 ---
-        if "logged_in_as" not in session:
+        else:
+            # This is the line that was likely causing recursion if not handled properly
+            # by immediately returning after a successful login attempt.
             line_bot_api.reply_message(reply_token, TextSendMessage(text="請先輸入密碼登入 (例如：密碼 [您的隊伍密碼] 或 管理員密碼 [您的管理員密碼])。"))
-            return
+            return # Ensure exit here if not logged in
 
-        # --- 隊伍功能 ---
-        if session["logged_in_as"] == "team":
-            team_id = session["team_id"]
-            team_name = session["team_name"]
-
-            if text.startswith("新增卡牌 "):
-                parts = text.split(" ", 2)
-                if len(parts) == 3:
-                    card_input = parts[1]
-                    try:
-                        quantity = int(parts[2])
-                        if quantity <= 0: raise ValueError
-                    except ValueError:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="數量必須為正整數。"))
-                        return
-
-                    card = find_card_by_input(db, card_input)
-                    if not card:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到卡牌：{card_input}"))
-                        return
-
-                    team_card = db.query(TeamCard).filter(TeamCard.team_id == team_id, TeamCard.card_id == card.id).first()
-                    if team_card:
-                        team_card.quantity += quantity
+    # --- Team User Logic ---
+    if user and user.role == 'team':
+        if text.lower() == '我的隊伍':
+            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"您的隊伍是：{user.team_name}"))
+        elif text.lower().startswith('完成任務 '):
+            parts = text.split(' ', 1)
+            if len(parts) == 2:
+                mission_code = parts[1].upper()
+                session = Session()
+                mission = session.query(Mission).filter_by(mission_code=mission_code).first()
+                if mission:
+                    if not mission.is_completed:
+                        mission.is_completed = True
+                        mission.completion_time = datetime.utcnow()
+                        mission.completed_by_team = user.team_name
+                        session.commit()
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"任務 '{mission.name}' 已成功標記為完成！"))
                     else:
-                        new_team_card = TeamCard(team_id=team_id, card_id=card.id, quantity=quantity)
-                        db.add(new_team_card)
-                    db.commit()
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已為 {team_name} 新增 {card.name_zh} x {quantity}。"))
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"任務 '{mission.name}' 已經被隊伍 {mission.completed_by_team} 完成了。"))
                 else:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：新增卡牌 [卡號/卡片名稱] [數量]"))
-
-            elif text.startswith("刪除卡牌 "):
-                parts = text.split(" ", 2)
-                if len(parts) == 3:
-                    card_input = parts[1]
-                    try:
-                        quantity_to_remove = int(parts[2])
-                        if quantity_to_remove <= 0: raise ValueError
-                    except ValueError:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="數量必須為正整數。"))
-                        return
-
-                    card = find_card_by_input(db, card_input)
-                    if not card:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到卡牌：{card_input}"))
-                        return
-
-                    team_card = db.query(TeamCard).filter(TeamCard.team_id == team_id, TeamCard.card_id == card.id).first()
-                    if team_card:
-                        if team_card.quantity >= quantity_to_remove:
-                            team_card.quantity -= quantity_to_remove
-                            if team_card.quantity == 0:
-                                db.delete(team_card)
-                            db.commit()
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已從 {team_name} 刪除 {card.name_zh} x {quantity_to_remove}。"))
-                        else:
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team_name} 的 {card.name_zh} 數量不足 ({team_card.quantity})。"))
-                    else:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team_name} 並沒有 {card.name_zh} 這張卡牌。"))
-                else:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：刪除卡牌 [卡號/卡片名稱] [數量]"))
-
-            elif text == "查看卡牌":
-                team_cards = db.query(TeamCard).filter(TeamCard.team_id == team_id).all()
-                if not team_cards:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team_name} 目前沒有任何卡牌。"))
-                    return
-
-                messages = [f"{team_name} 的卡牌列表："]
-                for tc in team_cards:
-                    messages.append(f"  - {tc.card.card_number} ({tc.card.name_zh}): {tc.quantity} 張")
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="\n".join(messages)))
-
-            elif text == "登出":
-                clear_user_session(user_id)
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="您已成功登出。"))
-
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="任務代碼無效，請檢查後重試。"))
+                session.close()
             else:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="無法識別的隊伍指令。請使用：新增卡牌、刪除卡牌、查看卡牌 或 登出。"))
-
-        # --- 關主/主辦方功能 ---
-        elif session["logged_in_as"] in ["game_master", "organizer"]:
-            admin_role = session["logged_in_as"]
-            team_scope_str = session.get("team_scope")
-            
-            allowed_team_ids = None
-            if team_scope_str:
-                try:
-                    allowed_team_ids = [int(x) for x in team_scope_str.split(',')]
-                except ValueError:
-                    app.logger.error(f"Invalid team_scope format: {team_scope_str} for user {user_id}")
-                    allowed_team_ids = [] # 無效格式則無權限
-
-            def check_team_access(team_obj_or_id):
-                if allowed_team_ids is None: # None表示可以操作所有隊伍 (主辦方)
-                    return True
-                
-                team_id_to_check = team_obj_or_id if isinstance(team_obj_or_id, int) else team_obj_or_id.id
-                return team_id_to_check in allowed_team_ids
-
-            # 輔助函數：獲取隊伍物件並檢查權限
-            def get_team_by_name(team_name_input):
-                team = db.query(Team).filter(Team.name == team_name_input).first()
-                if not team:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到隊伍：{team_name_input}"))
-                    return None
-                if not check_team_access(team):
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"您無權操作隊伍：{team_name_input}"))
-                    return None
-                return team
-
-            if text.startswith("新增 "): # 統一處理管理員新增卡牌
-                match = re.match(r"新增 (.+) (.+) (\d+)", text)
-                if match:
-                    team_name_input, card_input, quantity_str = match.groups()
-                    quantity = int(quantity_str)
-                    if quantity <= 0:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="數量必須為正整數。"))
-                        return
-
-                    team = get_team_by_name(team_name_input)
-                    if not team: return
-
-                    card = find_card_by_input(db, card_input)
-                    if not card:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到卡牌：{card_input}"))
-                        return
-
-                    team_card = db.query(TeamCard).filter(TeamCard.team_id == team.id, TeamCard.card_id == card.id).first()
-                    if team_card:
-                        team_card.quantity += quantity
-                    else:
-                        new_team_card = TeamCard(team_id=team.id, card_id=card.id, quantity=quantity)
-                        db.add(new_team_card)
-                    db.commit()
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已為 {team.name} 新增 {card.name_zh} x {quantity}。"))
-                else:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"指令格式：新增 [隊伍名稱] [卡號/卡片名稱] [數量]"))
-
-            elif text.startswith("刪除 "): # 統一處理管理員刪除卡牌
-                match = re.match(r"刪除 (.+) (.+) (\d+)", text)
-                if match:
-                    team_name_input, card_input, quantity_str = match.groups()
-                    quantity_to_remove = int(quantity_str)
-                    if quantity_to_remove <= 0:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="數量必須為正整數。"))
-                        return
-
-                    team = get_team_by_name(team_name_input)
-                    if not team: return
-
-                    card = find_card_by_input(db, card_input)
-                    if not card:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到卡牌：{card_input}"))
-                        return
-
-                    team_card = db.query(TeamCard).filter(TeamCard.team_id == team.id, TeamCard.card_id == card.id).first()
-                    if team_card:
-                        if team_card.quantity >= quantity_to_remove:
-                            team_card.quantity -= quantity_to_remove
-                            if team_card.quantity == 0:
-                                db.delete(team_card)
-                            db.commit()
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已從 {team.name} 刪除 {card.name_zh} x {quantity_to_remove}。"))
-                        else:
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team.name} 的 {card.name_zh} 數量不足 ({team_card.quantity})。"))
-                    else:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team.name} 並沒有 {card.name_zh} 這張卡牌。"))
-                else:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"指令格式：刪除 [隊伍名稱] [卡號/卡片名稱] [數量]"))
-
-            elif text.startswith("交換 "): # 統一處理管理員交換指令
-                # 預期格式: 交換 [隊伍A名稱] [隊伍B名稱] [卡A號/名] [卡A數量] [卡B號/名] [卡B數量]
-                match = re.match(r"交換 (.+) (.+) (.+) (\d+) (.+) (\d+)", text)
-
-                if match:
-                    team_a_name, team_b_name, card_a_input, qty_a_str, card_b_input, qty_b_str = match.groups()
-                    qty_a = int(qty_a_str)
-                    qty_b = int(qty_b_str)
-
-                    if qty_a <= 0 or qty_b <= 0:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="交換數量必須為正整數。"))
-                        return
-
-                    team_a = get_team_by_name(team_a_name)
-                    team_b = get_team_by_name(team_b_name)
-                    if not team_a or not team_b: return
-                    if team_a.id == team_b.id:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="不能和同一個隊伍交換卡牌。"))
-                        return
-
-                    card_a = find_card_by_input(db, card_a_input)
-                    card_b = find_card_by_input(db, card_b_input)
-                    if not card_a or not card_b:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到卡牌，請檢查：{card_a_input} 或 {card_b_input}"))
-                        return
-                    if card_a.id == card_b.id and qty_a != qty_b:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text="交換相同卡牌時，數量必須一致。"))
-                        return
-
-                    # 檢查隊伍卡牌數量是否足夠
-                    team_a_has_card_a = db.query(TeamCard).filter(TeamCard.team_id == team_a.id, TeamCard.card_id == card_a.id).first()
-                    team_b_has_card_b = db.query(TeamCard).filter(TeamCard.team_id == team_b.id, TeamCard.card_id == card_b.id).first()
-
-                    if not team_a_has_card_a or team_a_has_card_a.quantity < qty_a:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team_a.name} 的 {card_a.name_zh} 數量不足。"))
-                        return
-                    if not team_b_has_card_b or team_b_has_card_b.quantity < qty_b:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{team_b.name} 的 {card_b.name_zh} 數量不足。"))
-                        return
-
-                    # 交易請求邏輯 (兩階段確認)
-                    current_time = datetime.now()
-                    # 考慮請求過期時間，這裡設置為 5 分鐘
-                    trade_request_expiry_minutes = 5 
-                    five_minutes_ago = current_time - timedelta(minutes=trade_request_expiry_minutes)
-                    
-                    # 查詢未過期且匹配的請求
-                    existing_request = db.query(TradeRequest).filter(
-                        TradeRequest.action_type == 'team_to_team_trade',
-                        TradeRequest.team_a_id == team_a.id,
-                        TradeRequest.team_b_id == team_b.id,
-                        TradeRequest.card_a_id == card_a.id,
-                        TradeRequest.card_a_quantity == qty_a,
-                        TradeRequest.card_b_id == card_b.id,
-                        TradeRequest.card_b_quantity == qty_b,
-                        TradeRequest.status.in_(['pending']), # 僅查找 pending 狀態
-                        TradeRequest.created_at >= five_minutes_ago
-                    ).first()
-
-                    if existing_request:
-                        # 這是第二人確認，確保不是同一個用戶重複確認
-                        if existing_request.requester_user_id == user_id:
-                            line_bot_api.reply_message(reply_token, TextSendMessage(text="您已發起過此交換請求，請等待另一位具有相同權限的夥伴確認。"))
-                            return
-                        
-                        existing_request.status = 'completed' # 兩人確認即完成
-                        existing_request.completed_at = current_time # 記錄完成時間
-
-                        # 執行交易 (A隊減少卡A，增加卡B；B隊減少卡B，增加卡A)
-                        # 處理 team_a 的卡牌
-                        if team_a_has_card_a:
-                            team_a_has_card_a.quantity -= qty_a
-                            if team_a_has_card_a.quantity <= 0: # 數量為0或負數則刪除
-                                db.delete(team_a_has_card_a)
-                        
-                        team_a_gets_card_b = db.query(TeamCard).filter(TeamCard.team_id == team_a.id, TeamCard.card_id == card_b.id).first()
-                        if team_a_gets_card_b:
-                            team_a_gets_card_b.quantity += qty_b
-                        else:
-                            db.add(TeamCard(team_id=team_a.id, card_id=card_b.id, quantity=qty_b))
-
-                        # 處理 team_b 的卡牌
-                        if team_b_has_card_b:
-                            team_b_has_card_b.quantity -= qty_b
-                            if team_b_has_card_b.quantity <= 0: # 數量為0或負數則刪除
-                                db.delete(team_b_has_card_b)
-                        
-                        team_b_gets_card_a = db.query(TeamCard).filter(TeamCard.team_id == team_b.id, TeamCard.card_id == card_a.id).first()
-                        if team_b_gets_card_a:
-                            team_b_gets_card_a.quantity += qty_a
-                        else:
-                            db.add(TeamCard(team_id=team_b.id, card_id=card_a.id, quantity=qty_a))
-
-                        db.commit() # 提交所有卡牌數量變更
-
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"交換成功！{team_a.name} 與 {team_b.name} 已完成卡牌交換。"))
-                        
-                        # 通知發起者 (如果不是同一個用戶，且對方存在)
-                        try:
-                            # 獲取發起請求的用戶 ID
-                            original_requester_user_id = existing_request.requester_user_id
-                            if original_requester_user_id and original_requester_user_id != user_id:
-                                line_bot_api.push_message(original_requester_user_id, TextSendMessage(text="您發起的卡牌交換已成功確認並執行！"))
-                        except Exception as e:
-                            app.logger.error(f"Failed to push message to original requester: {e}")
-                    else:
-                        # 這是第一次發起請求
-                        new_request_id = str(uuid.uuid4()) # 生成唯一的請求 ID
-                        new_trade_request = TradeRequest(
-                            request_id=new_request_id,
-                            requester_user_id=user_id,
-                            status='pending',
-                            action_type='team_to_team_trade',
-                            team_a_id=team_a.id,
-                            team_b_id=team_b.id,
-                            card_a_id=card_a.id,
-                            card_a_quantity=qty_a,
-                            card_b_id=card_b.id,
-                            card_b_quantity=qty_b,
-                            created_at=current_time # 記錄創建時間
-                        )
-                        db.add(new_trade_request)
-                        db.commit()
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"卡牌交換請求已發起！請在 {trade_request_expiry_minutes} 分鐘內由另一位具有相同權限的夥伴輸入**完全相同**的指令以確認交換。"))
-
-                else:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"指令格式：交換 [隊伍A名稱] [隊伍B名稱] [卡牌A號/名] [卡牌A數量] [卡牌B號/名] [卡牌B數量]"))
-
-            elif text == "登出":
-                clear_user_session(user_id)
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="您已成功登出管理員模式。"))
-
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的任務代碼 (例如：完成任務 M001)。"))
+        elif text.lower() == '查看任務':
+            missions = get_all_missions()
+            if missions:
+                response = "目前任務列表：\n"
+                for m in missions:
+                    status = "✅ 已完成" if m.is_completed else "⏳ 未完成"
+                    response += f"代碼：{m.mission_code}, 名稱：{m.name}, 狀態：{status}\n"
+                    if m.is_completed:
+                        completion_time_local = pytz.utc.localize(m.completion_time).astimezone(pytz.timezone('Asia/Taipei'))
+                        response += f"  完成時間：{completion_time_local.strftime('%Y-%m-%d %H:%M')}, 完成隊伍：{m.completed_by_team}\n"
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=response))
             else:
-                line_bot_api.reply_message(reply_token, TextSendMessage(text="無法識別的管理員指令。請使用：新增、刪除、交換 或 登出。"))
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="目前沒有任何任務。"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="您已登入為隊伍。可用的指令有：\n1. 我的隊伍\n2. 完成任務 [任務代碼]\n3. 查看任務"))
+        return # Crucial: Exit after handling team commands
 
-    except Exception as e:
-        app.logger.error(f"Error handling message for user {user_id}: {e}", exc_info=True)
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="系統發生錯誤，請稍後再試。"))
-    finally:
-        db.close() # 確保資料庫會話被關閉
+    # --- Admin User Logic ---
+    if user and user.role == 'admin':
+        if text.lower() == '管理員指令':
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="管理員指令列表：\n1. 添加任務 [代碼] [名稱] [描述]\n2. 查看所有任務\n3. 重置任務 [代碼] (管理員專用)\n4. 查看所有隊伍\n5. 發布公告 [時間(YYYY-MM-DD HH:MM)] [訊息]\n6. 查看所有公告\n7. 取消公告 [ID]"))
+        elif text.lower().startswith('添加任務 '):
+            parts = text.split(' ', 3) # Split into 4 parts: command, code, name, description
+            if len(parts) == 4:
+                mission_code = parts[1].upper()
+                mission_name = parts[2]
+                mission_description = parts[3]
+                session = Session()
+                if not session.query(Mission).filter_by(mission_code=mission_code).first():
+                    new_mission = Mission(mission_code=mission_code, name=mission_name, description=mission_description)
+                    session.add(new_mission)
+                    session.commit()
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"任務 '{mission_name}' (代碼：{mission_code}) 已添加。"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="任務代碼已存在，請使用不同的代碼。"))
+                session.close()
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的指令格式：添加任務 [代碼] [名稱] [描述]"))
+        elif text.lower() == '查看所有任務':
+            missions = get_all_missions()
+            if missions:
+                response = "所有任務列表：\n"
+                for m in missions:
+                    status = "✅ 已完成" if m.is_completed else "⏳ 未完成"
+                    response += f"代碼：{m.mission_code}, 名稱：{m.name}, 狀態：{status}\n"
+                    if m.is_completed:
+                        completion_time_local = pytz.utc.localize(m.completion_time).astimezone(pytz.timezone('Asia/Taipei'))
+                        response += f"  完成時間：{completion_time_local.strftime('%Y-%m-%d %H:%M')}, 完成隊伍：{m.completed_by_team}\n"
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=response))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="目前沒有任何任務。"))
+        elif text.lower().startswith('重置任務 '):
+            parts = text.split(' ', 1)
+            if len(parts) == 2:
+                mission_code = parts[1].upper()
+                session = Session()
+                mission = session.query(Mission).filter_by(mission_code=mission_code).first()
+                if mission:
+                    mission.is_completed = False
+                    mission.completion_time = None
+                    mission.completed_by_team = None
+                    session.commit()
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"任務 '{mission.name}' 已重置為未完成。"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="任務代碼無效。"))
+                session.close()
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的任務代碼 (例如：重置任務 M001)。"))
+        elif text.lower() == '查看所有隊伍':
+            teams = get_all_teams()
+            if teams:
+                response = "所有隊伍列表：\n"
+                for t in teams:
+                    if t.team_name and t.role == 'team':
+                        response += f"隊伍名稱：{t.team_name}, 用戶ID：{t.user_id}\n"
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=response))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="目前沒有任何隊伍。"))
+        elif text.lower().startswith('發布公告 '):
+            parts = text.split(' ', 2) # Split into 3 parts: command, time, message
+            if len(parts) == 3:
+                scheduled_time_str = parts[1]
+                announcement_message = parts[2]
+                if schedule_announcement(announcement_message, scheduled_time_str):
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"公告已成功安排於 {scheduled_time_str} 發送。"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="時間格式無效 (應為 YYYY-MM-DD HH:MM) 或排程失敗。"))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的指令格式：發布公告 [時間(YYYY-MM-DD HH:MM)] [訊息]"))
+        elif text.lower() == '查看所有公告':
+            announcements = get_all_scheduled_announcements()
+            if announcements:
+                response = "所有排程公告列表：\n"
+                for a in announcements:
+                    scheduled_time_local = pytz.utc.localize(a.scheduled_time).astimezone(pytz.timezone('Asia/Taipei'))
+                    response += f"ID: {a.id}, 時間: {scheduled_time_local.strftime('%Y-%m-%d %H:%M')}, 訊息: {a.message}\n"
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=response))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="目前沒有任何排程公告。"))
+        elif text.lower().startswith('取消公告 '):
+            parts = text.split(' ', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                announcement_id = int(parts[1])
+                if cancel_announcement_by_id(announcement_id):
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"公告 ID {announcement_id} 已取消並刪除。"))
+                else:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到公告 ID {announcement_id} 或取消失敗。"))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="請輸入有效的公告 ID (例如：取消公告 1)。"))
+        else:
+            line_bot_api.reply_message(reply_token, TextSendMessage(text="您已登入為管理員。輸入 '管理員指令' 查看可用指令。"))
+        return # Crucial: Exit after handling admin commands
 
-# --- 後台任務 (例如清除過期交易請求) ---
+    # Fallback for unhandled messages (should not be reached if previous 'return' statements work)
+    app.logger.warning(f"Unhandled message from user {user_id} ({user.role if user else 'guest'}): {text}")
+    line_bot_api.reply_message(reply_token, TextSendMessage(text="對不起，我不明白您的意思。"))
 
-def cleanup_expired_trade_requests():
-    """清理過期的交易請求"""
-    with app.app_context(): # 確保在 Flask 應用上下文中執行
-        db = next(get_db())
-        try:
-            current_time = datetime.now()
-            # 與交易指令中的時間限制保持一致
-            expired_time_limit = timedelta(minutes=5) 
-            expired_requests = db.query(TradeRequest).filter(
-                TradeRequest.status.in_(['pending']), # 只清理 pending 狀態的請求
-                (current_time - TradeRequest.created_at) > expired_time_limit
-            ).all()
 
-            for req in expired_requests:
-                req.status = 'expired'
-                app.logger.info(f"Trade request {req.request_id} expired and marked.")
-                # 可以選擇通知發起者請求已過期
-                try:
-                    line_bot_api.push_message(req.requester_user_id, TextSendMessage(text="您發起的卡牌交換請求已過期，請重新發起。"))
-                except Exception as e:
-                    app.logger.error(f"Failed to notify requester {req.requester_user_id} about expired trade: {e}")
-            db.commit()
-        except Exception as e:
-            app.logger.error(f"Error cleaning up expired requests: {e}", exc_info=True)
-        finally:
-            db.close()
-
-# 啟動後台排程器
-scheduler = BackgroundScheduler()
-# 每 30 秒執行一次清理任務，確保及時處理過期請求
-scheduler.add_job(cleanup_expired_trade_requests, 'interval', seconds=30, id='cleanup_trades')
-scheduler.start()
-
-# --- 運行 Flask 應用 ---
+# --- Main Application Run ---
 if __name__ == "__main__":
+    init_db()
+    add_initial_data() # Ensure initial admins are added
+    if not scheduler.running:
+        scheduler.start()
+        app.logger.info("Scheduler started.")
+
+    # Render.com will set the PORT environment variable
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host="0.0.0.0", port=port)

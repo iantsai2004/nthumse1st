@@ -16,9 +16,9 @@ from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey    
-from sqlalchemy.ext.declarative import declarative_base 
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
+from database import engine, Base, SessionLocal as Session
 
 # --- Configuration ---
 # Load environment variables from .env file
@@ -49,11 +49,7 @@ def load_passwords(filename):
     with open(path, 'r', encoding='utf-8') as f:
         return [line.strip() for line in f if line.strip()]
 
-# --- Database Configuration (SQLite for simplicity) ---
-DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///app.db')
-engine = create_engine(DATABASE_URL)
-Base = declarative_base()
-Session = sessionmaker(bind=engine)
+# --- Database Configuration is handled in database.py ---
 
 # --- Database Models ---
 class User(Base):
@@ -87,8 +83,10 @@ class Announcement(Base):
 
 class Card(Base):
     __tablename__ = 'cards'
-    id = Column(Integer, primary_key=True)
-    name = Column(String(100), unique=True, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
+    card_number = Column(String, unique=True, index=True, nullable=False)
+    name_zh = Column(String, nullable=False)
+    name_en = Column(String, nullable=True)
 
 class TeamCard(Base):
     __tablename__ = 'team_cards'
@@ -211,9 +209,9 @@ def get_all_admins():
     return admins
 
 def find_or_create_card(session, name):
-    card = session.query(Card).filter_by(name=name).first()
+    card = session.query(Card).filter_by(name_zh=name).first()
     if not card:
-        card = Card(name=name)
+        card = Card(card_number=name, name_zh=name)
         session.add(card)
         session.commit()
     return card
@@ -229,7 +227,7 @@ def add_card_to_team(session, user, card_name, quantity):
     session.commit()
 
 def remove_card_from_team(session, user, card_name, quantity):
-    card = session.query(Card).filter_by(name=card_name).first()
+    card = session.query(Card).filter_by(name_zh=card_name).first()
     if not card:
         return False, f"找不到卡牌：{card_name}"
     team_card = session.query(TeamCard).filter_by(team_id=user.id, card_id=card.id).first()
@@ -585,7 +583,7 @@ def handle_message(event):
             session = Session()
             team_cards = list_team_cards(session, user)
             if team_cards:
-                response = f"{user.team_name} 的卡牌列表：\n"
+                response += f"{tc.card.name_zh}: {tc.quantity}\n"
                 for tc in team_cards:
                     response += f"{tc.card.name}: {tc.quantity}\n"
                 line_bot_api.reply_message(reply_token, TextSendMessage(text=response))

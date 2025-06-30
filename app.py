@@ -38,6 +38,17 @@ handler = WebhookHandler(CHANNEL_SECRET)
 
 app = Flask(__name__)
 
+# Directory containing password files
+PASSWORD_DIR = os.path.join(os.path.dirname(__file__), 'passwords')
+
+# Helper to load passwords from a file (one per line)
+def load_passwords(filename):
+    path = os.path.join(PASSWORD_DIR, filename)
+    if not os.path.isfile(path):
+        return []
+    with open(path, 'r', encoding='utf-8') as f:
+        return [line.strip() for line in f if line.strip()]
+
 # --- Database Configuration (SQLite for simplicity) ---
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///app.db')
 engine = create_engine(DATABASE_URL)
@@ -83,13 +94,46 @@ def add_initial_data():
     print("Checking and adding initial data...")
     session = Session()
 
-    # Add initial admin users if they don't exist
-    admin_passwords = ['gm_A5_pass', 'gm_A6_pass', 'gm_A7_pass', 'gm_A8_pass']
-    for pwd in admin_passwords:
+    # Load passwords from external files
+    gm_passwords = load_passwords('gm_passwords.txt')
+    organizer_passwords = load_passwords('organizer_passwords.txt')
+    team_passwords = load_passwords('team_passwords.txt')
+
+    # Add Game Master admin accounts
+    for idx, pwd in enumerate(gm_passwords, start=1):
         if not session.query(User).filter_by(role='admin', admin_password=pwd).first():
-            new_admin = User(user_id=f'admin_placeholder_{pwd}', role='admin', team_name='game_master', admin_password=pwd)
+            new_admin = User(
+                user_id=f'gm_placeholder_{idx}',
+                role='admin',
+                team_name='game_master',
+                admin_password=pwd
+            )
             session.add(new_admin)
-            print(f"Added Admin: game_master with password '{pwd}'")
+            print(f"Added Admin: game_master #{idx} with password '{pwd}'")
+
+    # Add Organizer admin accounts
+    for idx, pwd in enumerate(organizer_passwords, start=1):
+        if not session.query(User).filter_by(role='admin', admin_password=pwd).first():
+            new_admin = User(
+                user_id=f'organizer_placeholder_{idx}',
+                role='admin',
+                team_name='organizer',
+                admin_password=pwd
+            )
+            session.add(new_admin)
+            print(f"Added Admin: organizer #{idx} with password '{pwd}'")
+
+    # Add Team placeholders
+    for idx, pwd in enumerate(team_passwords, start=1):
+        if not session.query(User).filter_by(role='team', team_password=pwd).first():
+            new_team = User(
+                user_id=f'team_placeholder_{idx}',
+                role='team',
+                team_name=f'隊伍-{idx}',
+                team_password=pwd
+            )
+            session.add(new_team)
+            print(f"Added Team: 隊伍-{idx} with password '{pwd}'")
 
     session.commit()
     session.close()

@@ -9,7 +9,7 @@ gevent.monkey.patch_all()
 import os
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
@@ -208,11 +208,22 @@ def send_announcement(announcement_id, user_id=None):
                 for user in users:
                     try:
                         line_bot_api.push_message(user.user_id, TextSendMessage(text=f"📢 公告：\n{announcement.message}"))
+                    except LineBotApiError as e:
+                        app.logger.error(f"Failed to send announcement to user {user.user_id}: {e}")
+                        if e.status_code == 401:
+                            app.logger.error("Authentication failed. Check LINE_CHANNEL_ACCESS_TOKEN.")
                     except Exception as e:
                         app.logger.error(f"Failed to send announcement to user {user.user_id}: {e}")
             else:
                 # Send to a specific user
-                line_bot_api.push_message(user_id, TextSendMessage(text=f"📢 公告：\n{announcement.message}"))
+                 try:
+                    line_bot_api.push_message(user_id, TextSendMessage(text=f"📢 公告：\n{announcement.message}"))
+                 except LineBotApiError as e:
+                    app.logger.error(f"Failed to send announcement to user {user_id}: {e}")
+                    if e.status_code == 401:
+                        app.logger.error("Authentication failed. Check LINE_CHANNEL_ACCESS_TOKEN.")
+                 except Exception as e:
+                    app.logger.error(f"Failed to send announcement to user {user_id}: {e}")
 
             announcement.sent = True
             session.commit()
@@ -290,6 +301,11 @@ def callback():
     except InvalidSignatureError:
         app.logger.error("Invalid signature. Please check your channel access token/channel secret.")
         abort(400)
+    except LineBotApiError as e:
+        app.logger.error(f"LineBot API error: {e}")
+        if e.status_code == 401:
+            app.logger.error("Authentication failed. Check LINE_CHANNEL_ACCESS_TOKEN.")
+        return 'OK'
     except Exception as e:
         app.logger.error(f"Error handling webhook: {e}")
         # Here's the crucial part: if an error occurs while handling a message,

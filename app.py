@@ -241,6 +241,69 @@ def remove_card_from_team(session, user, card_name, quantity):
     session.commit()
     return True, None
 
+# Pending trade requests stored in memory. Key is a normalized tuple
+# representing the teams and cards involved. Value stores a timestamp and
+# the user_ids that have confirmed the trade.
+pending_trades = {}
+
+def _normalize_trade(team_a, card_a, qty_a, team_b, card_b, qty_b):
+    """Return a canonical representation of a trade so A<->B and B<->A match."""
+    if team_a <= team_b:
+        return (team_a, card_a, qty_a, team_b, card_b, qty_b)
+    return (team_b, card_b, qty_b, team_a, card_a, qty_a)
+
+def execute_trade(team_a, card_a, qty_a, team_b, card_b, qty_b):
+    """Transfer cards between two teams if both have sufficient quantity."""
+    session = Session()
+    try:
+        team_a_user = session.query(User).filter_by(team_name=team_a, role='team').first()
+        team_b_user = session.query(User).filter_by(team_name=team_b, role='team').first()
+        if not team_a_user or not team_b_user:
+            return False, "找不到指定隊伍。"
+
+        card_a_obj = find_or_create_card(session, card_a)
+        card_b_obj = find_or_create_card(session, card_b)
+
+        tc_a = session.query(TeamCard).filter_by(team_id=team_a_user.id, card_id=card_a_obj.id).first()
+        tc_b = session.query(TeamCard).filter_by(team_id=team_b_user.id, card_id=card_b_obj.id).first()
+
+        if not tc_a or tc_a.quantity < qty_a:
+            return False, f"{team_a} 的 {card_a} 數量不足。"
+        if not tc_b or tc_b.quantity < qty_b:
+            return False, f"{team_b} 的 {card_b} 數量不足。"
+
+        # Deduct cards from each team
+        tc_a.quantity -= qty_a
+        if tc_a.quantity == 0:
+            session.delete(tc_a)
+        tc_b.quantity -= qty_b
+        if tc_b.quantity == 0:
+            session.delete(tc_b)
+
+        # Add cards to opposite teams
+        tc_a_receive = session.query(TeamCard).filter_by(team_id=team_a_user.id, card_id=card_b_obj.id).first()
+        if tc_a_receive:
+            tc_a_receive.quantity += qty_b
+        else:
+            tc_a_receive = TeamCard(team_id=team_a_user.id, card_id=card_b_obj.id, quantity=qty_b)
+            session.add(tc_a_receive)
+
+        tc_b_receive = session.query(TeamCard).filter_by(team_id=team_b_user.id, card_id=card_a_obj.id).first()
+        if tc_b_receive:
+            tc_b_receive.quantity += qty_a
+        else:
+            tc_b_receive = TeamCard(team_id=team_b_user.id, card_id=card_a_obj.id, quantity=qty_a)
+            session.add(tc_b_receive)
+
+        session.commit()
+        return True, None
+    except Exception as e:
+        session.rollback()
+        return False, str(e)
+    finally:
+        session.close()
+
+
 def list_team_cards(session, user):
     return session.query(TeamCard).filter_by(team_id=user.id).all()
 
@@ -480,9 +543,44 @@ def handle_message(event):
                     if success:
                         line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已從 {user.team_name} 刪除 {card_name} x{qty}。"))
                     else:
-                        line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+                            line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：刪除卡牌 [卡片名稱] [數量]"))
+                
             else:
                 line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：刪除卡牌 [卡片名稱] [數量]"))
+        elif text.startswith('交換卡牌 '):
+            parts = text.split(' ')
+            if len(parts) == 7 and parts[4].isdigit() and parts[6].isdigit():
+                team_a = parts[1]
+                team_b = parts[2]
+                card_a = parts[3]
+                qty_a = int(parts[4])
+                card_b = parts[5]
+                qty_b = int(parts[6])
+
+                key = _normalize_trade(team_a, card_a, qty_a, team_b, card_b, qty_b)
+                now = datetime.utcnow()
+                record = pending_trades.get(key)
+
+                if record and (now - record['timestamp']) <= timedelta(minutes=1):
+                    record['user_ids'].add(user_id)
+                    if len(record['user_ids']) >= 2:
+                        success, msg = execute_trade(team_a, card_a, qty_a, team_b, card_b, qty_b)
+                        pending_trades.pop(key, None)
+                        if success:
+                            line_bot_api.reply_message(reply_token, TextSendMessage(text="卡牌交換成功！"))
+                        else:
+                            line_bot_api.reply_message(reply_token, TextSendMessage(text=f"交換失敗：{msg}"))
+                    else:
+                        pending_trades[key] = record  # update timestamp untouched
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text="已收到交換請求，等待另一方確認。"))
+                else:
+                    pending_trades[key] = {
+                        'timestamp': now,
+                        'user_ids': {user_id}
+                    }
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="交換請求已建立，請對方在1分鐘內發送相同指令確認。"))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：交換卡牌 [隊伍A] [隊伍B] [卡片A] [數量A] [卡片B] [數量B]"))
         elif text == '查看卡牌':
             session = Session()
             team_cards = list_team_cards(session, user)
@@ -505,7 +603,8 @@ def handle_message(event):
                         "3. 查看任務\n"
                         "4. 新增卡牌 [卡片名稱] [數量]\n"
                         "5. 刪除卡牌 [卡片名稱] [數量]\n"
-                        "6. 查看卡牌"
+                        "6. 查看卡牌\n"
+                        "7. 交換卡牌 [隊伍A] [隊伍B] [卡片A] [數量A] [卡片B] [數量B]"
                     )
                 )
             )

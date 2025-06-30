@@ -16,9 +16,9 @@ from datetime import datetime, timedelta
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey    
+from sqlalchemy.ext.declarative import declarative_base 
+from sqlalchemy.orm import sessionmaker, relationship
 
 # --- Configuration ---
 # Load environment variables from .env file
@@ -65,6 +65,7 @@ class User(Base):
     last_active = Column(DateTime, default=datetime.utcnow)
     team_password = Column(String(50), nullable=True) # Storing passwords directly for simplicity, hash in real app
     admin_password = Column(String(50), nullable=True) # Storing passwords directly for simplicity, hash in real app
+    cards = relationship('TeamCard', back_populates='team')
 
 class Mission(Base):
     __tablename__ = 'missions'
@@ -83,6 +84,21 @@ class Announcement(Base):
     scheduled_time = Column(DateTime, nullable=True)
     sent = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class Card(Base):
+    __tablename__ = 'cards'
+    id = Column(Integer, primary_key=True)
+    name = Column(String(100), unique=True, nullable=False)
+
+class TeamCard(Base):
+    __tablename__ = 'team_cards'
+    id = Column(Integer, primary_key=True)
+    team_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    card_id = Column(Integer, ForeignKey('cards.id'), nullable=False)
+    quantity = Column(Integer, default=0, nullable=False)
+
+    team = relationship('User', back_populates='cards')
+    card = relationship('Card')
 
 # --- Database Initialization ---
 def init_db():
@@ -193,6 +209,41 @@ def get_all_admins():
     admins = session.query(User).filter_by(role='admin').all()
     session.close()
     return admins
+
+def find_or_create_card(session, name):
+    card = session.query(Card).filter_by(name=name).first()
+    if not card:
+        card = Card(name=name)
+        session.add(card)
+        session.commit()
+    return card
+
+def add_card_to_team(session, user, card_name, quantity):
+    card = find_or_create_card(session, card_name)
+    team_card = session.query(TeamCard).filter_by(team_id=user.id, card_id=card.id).first()
+    if team_card:
+        team_card.quantity += quantity
+    else:
+        team_card = TeamCard(team_id=user.id, card_id=card.id, quantity=quantity)
+        session.add(team_card)
+    session.commit()
+
+def remove_card_from_team(session, user, card_name, quantity):
+    card = session.query(Card).filter_by(name=card_name).first()
+    if not card:
+        return False, f"找不到卡牌：{card_name}"
+    team_card = session.query(TeamCard).filter_by(team_id=user.id, card_id=card.id).first()
+    if not team_card or team_card.quantity < quantity:
+        return False, "卡牌數量不足或不存在。"
+    team_card.quantity -= quantity
+    if team_card.quantity == 0:
+        session.delete(team_card)
+    session.commit()
+    return True, None
+
+def list_team_cards(session, user):
+    return session.query(TeamCard).filter_by(team_id=user.id).all()
+
 
 # --- Scheduler for Announcements ---
 scheduler = BackgroundScheduler(daemon=True)
@@ -401,8 +452,63 @@ def handle_message(event):
                 line_bot_api.reply_message(reply_token, TextSendMessage(text=response))
             else:
                 line_bot_api.reply_message(reply_token, TextSendMessage(text="目前沒有任何任務。"))
+        elif text.startswith('新增卡牌 '):
+            parts = text.split(' ', 2)
+            if len(parts) == 3 and parts[2].isdigit():
+                card_name = parts[1]
+                qty = int(parts[2])
+                if qty <= 0:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="數量必須為正整數。"))
+                else:
+                    session = Session()
+                    add_card_to_team(session, user, card_name, qty)
+                    session.close()
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已為 {user.team_name} 新增 {card_name} x{qty}。"))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：新增卡牌 [卡片名稱] [數量]"))
+        elif text.startswith('刪除卡牌 '):
+            parts = text.split(' ', 2)
+            if len(parts) == 3 and parts[2].isdigit():
+                card_name = parts[1]
+                qty = int(parts[2])
+                if qty <= 0:
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="數量必須為正整數。"))
+                else:
+                    session = Session()
+                    success, msg = remove_card_from_team(session, user, card_name, qty)
+                    session.close()
+                    if success:
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"已從 {user.team_name} 刪除 {card_name} x{qty}。"))
+                    else:
+                        line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text="指令格式：刪除卡牌 [卡片名稱] [數量]"))
+        elif text == '查看卡牌':
+            session = Session()
+            team_cards = list_team_cards(session, user)
+            if team_cards:
+                response = f"{user.team_name} 的卡牌列表：\n"
+                for tc in team_cards:
+                    response += f"{tc.card.name}: {tc.quantity}\n"
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=response))
+            else:
+                line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{user.team_name} 目前沒有任何卡牌。"))
+            session.close()
         else:
-            line_bot_api.reply_message(reply_token, TextSendMessage(text="您已登入為隊伍。可用的指令有：\n1. 我的隊伍\n2. 完成任務 [任務代碼]\n3. 查看任務"))
+            line_bot_api.reply_message(
+                reply_token,
+                TextSendMessage(
+                    text=(
+                        "您已登入為隊伍。可用的指令有：\n"
+                        "1. 我的隊伍\n"
+                        "2. 完成任務 [任務代碼]\n"
+                        "3. 查看任務\n"
+                        "4. 新增卡牌 [卡片名稱] [數量]\n"
+                        "5. 刪除卡牌 [卡片名稱] [數量]\n"
+                        "6. 查看卡牌"
+                    )
+                )
+            )
         return # Crucial: Exit after handling team commands
 
     # --- Admin User Logic ---

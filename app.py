@@ -139,6 +139,10 @@ def add_initial_data():
     session.close()
     print("Initial data check and addition complete.")
 
+# Ensure the database and initial accounts are ready when the module is imported
+init_db()
+add_initial_data()
+
 # --- Helper Functions ---
 def get_user(user_id):
     session = Session()
@@ -486,13 +490,17 @@ def handle_message(event):
     line_bot_api.reply_message(reply_token, TextSendMessage(text="對不起，我不明白您的意思。"))
 
 
-# --- Main Application Run ---
+# --- Initialization for WSGI environments ---
+# Ensure the database and scheduler are initialized even when the application
+# is launched by a WSGI server (e.g. Gunicorn) and the __main__ block is not
+# executed.
+init_db()
+add_initial_data()
+if not scheduler.running:
+    scheduler.start()
+    app.logger.info("Scheduler started.")
+
 if __name__ == "__main__":
-    init_db()
-    add_initial_data() # Ensure initial admins are added
-    if not scheduler.running:
-        scheduler.start()
-        app.logger.info("Scheduler started.")
 
     # Render.com will set the PORT environment variable
     port = int(os.environ.get("PORT", 5000))
